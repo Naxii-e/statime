@@ -16,7 +16,7 @@ use statime::{
     Clock, PtpInstance, PtpInstanceState, SharedClock,
 };
 use statime_linux::{
-    clock::{LinuxClock, PortTimestampToTime},
+    clock::{self, LinuxClock, PortTimestampToTime},
     config::{HardwareClock, PortConfig, ProtocolVersion, SystemClockType},
     initialize_logging_parse_config,
     observer::ObservableInstanceState,
@@ -368,18 +368,13 @@ async fn actual_main() {
         TimePropertiesDS::new_arbitrary_time(false, false, TimeSource::InternalOscillator);
 
     let system_clock = if config.virtual_system_clock {
-        let base_clockid = match config.virtual_system_clock_base {
-            SystemClockType::TAI => libc::CLOCK_TAI,
-            SystemClockType::Monotonic => libc::CLOCK_MONOTONIC,
-            SystemClockType::MonotonicRaw => libc::CLOCK_MONOTONIC_RAW,
-            SystemClockType::MonotonicCoarse => libc::CLOCK_MONOTONIC_COARSE,
-        };
+        let base_clockid = clock::base_clockid(config.virtual_system_clock_base.clone());
         let guard = if config.virtual_system_clock_base == SystemClockType::TAI && config.usrvclock_export {
             None
         } else {
             Some(Arc::new(Mutex::new(ClockExportGuard {
                 curr_overlay: None,
-                monotonic_clock: LinuxClock::from_clockid(libc::CLOCK_MONOTONIC_COARSE),
+                monotonic_clock: LinuxClock::guard_monotonic_clock(),
                 grace_period_until: None,
             })))
         };
@@ -448,16 +443,21 @@ async fn actual_main() {
         };
 
         if config.virtual_system_clock_base == SystemClockType::TAI {
-            let overlay_clock = OverlayClock::new(LinuxClock::CLOCK_TAI, exporter);
+            let overlay_clock = OverlayClock::new(LinuxClock::system_timestamp_clock(), exporter);
             SystemClock::Overlay(SharedClock::new(overlay_clock))
         } else {
-            let inner_overlay = SharedClock::new(OverlayClock::new(LinuxClock::CLOCK_TAI, CallbackExporter::no_op()));
+            let inner_overlay = SharedClock::new(OverlayClock::new(LinuxClock::system_timestamp_clock(), CallbackExporter::no_op()));
             tokio::spawn(intermediate_clock_task(LinuxClock::from_clockid(base_clockid), inner_overlay.clone()));
             let outer_overlay = OverlayClock::new(inner_overlay, exporter);
             SystemClock::DualLayer(SharedClock::new(outer_overlay))
         }
     } else {
-        SystemClock::Linux(LinuxClock::CLOCK_TAI)
+        #[cfg(target_os = "linux")]
+        {
+            SystemClock::Linux(LinuxClock::system_timestamp_clock())
+        }
+        #[cfg(not(target_os = "linux"))]
+        unreachable!("non-virtual system clock rejected by validate_platform")
     };
 
     // Leak to get a static reference, the ptp instance will be around for the rest

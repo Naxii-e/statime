@@ -22,6 +22,8 @@ pub enum SystemClockType {
     Monotonic,
     MonotonicRaw,
     MonotonicCoarse,
+    /// macOS `CLOCK_UPTIME_RAW`: monotonic, not slewed, does not advance during sleep
+    UptimeRaw,
 }
 
 impl<'de> Deserialize<'de> for SystemClockType {
@@ -39,6 +41,7 @@ impl<'de> Deserialize<'de> for SystemClockType {
             "MONOTONIC" => Ok(SystemClockType::Monotonic),
             "MONOTONIC_RAW" => Ok(SystemClockType::MonotonicRaw),
             "MONOTONIC_COARSE" => Ok(SystemClockType::MonotonicCoarse),
+            "UPTIME_RAW" => Ok(SystemClockType::UptimeRaw),
             _ => Err(D::Error::custom("invalid system clock type"))
         }
     }
@@ -256,7 +259,53 @@ impl Config {
         let contents = read_to_string(file).map_err(ConfigError::Io)?;
         let config: Config = toml::de::from_str(&contents).map_err(ConfigError::Toml)?;
         config.warn_when_unreasonable();
+        config.validate_platform()?;
         Ok(config)
+    }
+
+    /// Reject configurations the current platform cannot run.
+    ///
+    /// On macOS statime must never steer the kernel clock and has no PHC or
+    /// Ethernet transport, so only a virtual system clock based on
+    /// `CLOCK_UPTIME_RAW` with UDP ports and software timestamping is allowed.
+    pub fn validate_platform(&self) -> Result<(), ConfigError> {
+        #[cfg(target_os = "macos")]
+        {
+            if !self.virtual_system_clock {
+                return Err(ConfigError::Platform(
+                    "macOS requires virtual-system-clock = true (the kernel clock is never modified)".into(),
+                ));
+            }
+            if self.virtual_system_clock_base != SystemClockType::UptimeRaw {
+                return Err(ConfigError::Platform(format!(
+                    "macOS requires virtual-system-clock-base = \"uptime_raw\", got {:?}",
+                    self.virtual_system_clock_base
+                )));
+            }
+            for port in &self.ports {
+                if port.network_mode == NetworkMode::Ethernet {
+                    return Err(ConfigError::Platform(format!(
+                        "port {}: network-mode = \"ethernet\" is not supported on macOS",
+                        port.interface
+                    )));
+                }
+                if matches!(port.hardware_clock, HardwareClock::Required | HardwareClock::Specific(_)) {
+                    return Err(ConfigError::Platform(format!(
+                        "port {}: hardware clocks are not supported on macOS",
+                        port.interface
+                    )));
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if self.virtual_system_clock_base == SystemClockType::UptimeRaw {
+                return Err(ConfigError::Platform(
+                    "virtual-system-clock-base = \"uptime_raw\" is only supported on macOS".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Warns about unreasonable config values
@@ -275,6 +324,7 @@ impl Config {
 pub enum ConfigError {
     Io(std::io::Error),
     Toml(toml::de::Error),
+    Platform(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -282,6 +332,7 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::Io(e) => writeln!(f, "io error while reading config: {e}"),
             ConfigError::Toml(e) => writeln!(f, "config toml parsing error: {e}"),
+            ConfigError::Platform(e) => writeln!(f, "config not supported on this platform: {e}"),
         }
     }
 }
@@ -373,7 +424,7 @@ mod tests {
     use timestamped_socket::interface::InterfaceName;
 
     use crate::{
-        config::{SystemClockType, HardwareClock, ObservabilityConfig},
+        config::{Config, ConfigError, SystemClockType, HardwareClock, ObservabilityConfig},
         tracing::LogLevel,
     };
 
@@ -421,5 +472,41 @@ interface = "enp0s31f6"
         let actual = toml::from_str(MINIMAL_CONFIG).unwrap();
 
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn uptime_raw_parses() {
+        let cfg: Config = toml::from_str(r#"
+            virtual-system-clock = true
+            virtual-system-clock-base = "uptime_raw"
+            [[port]]
+            interface = "en0"
+        "#).unwrap();
+        assert_eq!(cfg.virtual_system_clock_base, SystemClockType::UptimeRaw);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_requires_virtual_system_clock() {
+        let cfg: Config = toml::from_str(r#"
+            [[port]]
+            interface = "en0"
+        "#).unwrap();
+        assert!(matches!(cfg.validate_platform(), Err(ConfigError::Platform(_))));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rejects_ethernet_and_required_hw_clock() {
+        for port in [r#"network-mode = "ethernet""#, r#"hardware-clock = "required""#] {
+            let cfg: Config = toml::from_str(&format!(r#"
+                virtual-system-clock = true
+                virtual-system-clock-base = "uptime_raw"
+                [[port]]
+                interface = "en0"
+                {port}
+            "#)).unwrap();
+            assert!(matches!(cfg.validate_platform(), Err(ConfigError::Platform(_))), "{port}");
+        }
     }
 }

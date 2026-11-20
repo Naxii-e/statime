@@ -1,10 +1,14 @@
-//! Implementation of the abstract clock for the linux platform
+//! Implementation of the abstract clock for the linux platform (and macOS)
 
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
 use clock_steering::{unix::UnixClock, TimeOffset};
+#[cfg(target_os = "linux")]
+use statime::config::LeapIndicator;
+use crate::config::SystemClockType;
 use statime::{
-    config::{LeapIndicator, TimePropertiesDS},
+    config::TimePropertiesDS,
     overlay_clock::{ClockOverlayExporter, OverlayClock},
     time::{Duration, Time},
     Clock, SharedClock,
@@ -13,22 +17,70 @@ use statime::{
 #[derive(Debug, Clone)]
 pub struct LinuxClock {
     clock: clock_steering::unix::UnixClock,
+    #[cfg(target_os = "linux")]
     is_tai: bool,
 }
 
+/// Map a configured virtual system clock base to its clock id.
+pub fn base_clockid(base: SystemClockType) -> libc::clockid_t {
+    match base {
+        #[cfg(target_os = "linux")]
+        SystemClockType::TAI => libc::CLOCK_TAI,
+        #[cfg(target_os = "linux")]
+        SystemClockType::Monotonic => libc::CLOCK_MONOTONIC,
+        #[cfg(target_os = "linux")]
+        SystemClockType::MonotonicRaw => libc::CLOCK_MONOTONIC_RAW,
+        #[cfg(target_os = "linux")]
+        SystemClockType::MonotonicCoarse => libc::CLOCK_MONOTONIC_COARSE,
+        #[cfg(target_os = "macos")]
+        SystemClockType::UptimeRaw => libc::CLOCK_UPTIME_RAW,
+        #[allow(unreachable_patterns)]
+        other => unreachable!("{other:?} rejected by validate_platform"),
+    }
+}
+
 impl LinuxClock {
+    #[cfg(target_os = "linux")]
     pub const CLOCK_TAI: Self = Self {
         clock: UnixClock::CLOCK_TAI,
         is_tai: true,
     };
 
-    pub fn from_clockid(clockid: libc::clockid_t) -> Self {
-        Self {
-            clock: UnixClock::from_clockid(clockid),
-            is_tai: clockid == libc::CLOCK_TAI
+    /// The clock that software (socket) timestamps are expressed in, used as
+    /// the system clock: CLOCK_TAI on Linux, CLOCK_REALTIME on macOS (which has
+    /// no TAI clock; the TAI offset is treated as zero there).
+    pub fn system_timestamp_clock() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::CLOCK_TAI
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::from_clockid(libc::CLOCK_REALTIME)
         }
     }
 
+    /// Cheap monotonic clock for the usrvclock export guard.
+    pub fn guard_monotonic_clock() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::from_clockid(libc::CLOCK_MONOTONIC_COARSE)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::from_clockid(libc::CLOCK_MONOTONIC)
+        }
+    }
+
+    pub fn from_clockid(clockid: libc::clockid_t) -> Self {
+        Self {
+            clock: UnixClock::from_clockid(clockid),
+            #[cfg(target_os = "linux")]
+            is_tai: clockid == libc::CLOCK_TAI,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let clock = UnixClock::open(path)?;
 
@@ -55,6 +107,7 @@ impl LinuxClock {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     pub fn open_idx(idx: u32) -> std::io::Result<Self> {
         let path = format!("/dev/ptp{}", idx);
         Self::open(path)
@@ -63,6 +116,7 @@ impl LinuxClock {
     /// Return three timestamps t1 t2 and t3 minted in that order.
     /// T1 and T3 are minted using the system TAI clock and T2 by the hardware
     /// clock
+    #[cfg(target_os = "linux")]
     pub fn system_offset(&self) -> Result<(Time, Time, Time), clock_steering::unix::Error> {
         // The clock crate's system offset gives the T1 and T3 timestamps on the
         // CLOCK_REALTIME timescale which is UTC, not TAI, so we need to correct
@@ -82,6 +136,7 @@ impl LinuxClock {
         })
     }
 
+    #[cfg(target_os = "linux")]
     pub fn get_tai_offset(&self) -> Result<i32, clock_steering::unix::Error> {
         use clock_steering::Clock;
         if self.is_tai {
@@ -90,8 +145,15 @@ impl LinuxClock {
             self.clock.get_tai()
         }
     }
+
+    /// macOS has no kernel TAI offset; all clocks are used as-is.
+    #[cfg(not(target_os = "linux"))]
+    pub fn get_tai_offset(&self) -> Result<i32, clock_steering::unix::Error> {
+        Ok(0)
+    }
 }
 
+#[cfg(target_os = "linux")]
 fn clock_timestamp_to_time(t: clock_steering::Timestamp) -> Time {
     Time::from_nanos((t.seconds as u64) * 1_000_000_000 + (t.nanos as u64))
 }
@@ -118,6 +180,7 @@ impl Clock for LinuxClock {
     fn set_frequency(&mut self, freq: f64) -> Result<Time, Self::Error> {
         use clock_steering::Clock;
         log::trace!("Setting clock frequency to {:e}ppm", freq);
+        #[cfg(target_os = "linux")]
         let timestamp = if self.is_tai {
             // Clock tai can't directly adjust frequency, so drive this through
             // clock_realtime and adjust the received timestamp
@@ -127,6 +190,8 @@ impl Clock for LinuxClock {
         } else {
             self.clock.set_frequency(freq)?
         };
+        #[cfg(not(target_os = "linux"))]
+        let timestamp = self.clock.set_frequency(freq)?;
         Ok(time_from_timestamp(timestamp, statime::Clock::now(self)))
     }
 
@@ -149,6 +214,7 @@ impl Clock for LinuxClock {
             (offset.seconds as f64) * 1e9 + (offset.nanos as f64)
         );
 
+        #[cfg(target_os = "linux")]
         let timestamp = if self.is_tai {
             // Clock tai can't directly step, so drive this through clock_realtime
             // and adjust the received timestamp
@@ -158,9 +224,18 @@ impl Clock for LinuxClock {
         } else {
             self.clock.step_clock(offset)?
         };
+        #[cfg(not(target_os = "linux"))]
+        let timestamp = self.clock.step_clock(offset)?;
         Ok(time_from_timestamp(timestamp, statime::Clock::now(self)))
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn set_properties(&mut self, _time_properties: &TimePropertiesDS) -> Result<(), Self::Error> {
+        // Never touch the kernel clock's TAI offset or leap state on macOS.
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     fn set_properties(&mut self, time_properties: &TimePropertiesDS) -> Result<(), Self::Error> {
         use clock_steering::Clock;
 
@@ -211,5 +286,18 @@ impl<T: PortTimestampToTime + Clock> PortTimestampToTime
 {
     fn port_timestamp_to_time(&self, ts: timestamped_socket::socket::Timestamp) -> Time {
         self.0.lock().unwrap().port_timestamp_to_time(ts)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_tai_offset_is_zero_and_set_properties_is_noop() {
+        let mut c = LinuxClock::system_timestamp_clock();
+        assert_eq!(c.get_tai_offset().unwrap(), 0);
+        let props = statime::config::TimePropertiesDS::new_arbitrary_time(false, false, statime::config::TimeSource::InternalOscillator);
+        assert!(statime::Clock::set_properties(&mut c, &props).is_ok());
     }
 }
