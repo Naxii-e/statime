@@ -4,6 +4,7 @@ pub mod clock;
 pub mod config;
 pub mod metrics;
 pub mod observer;
+pub mod sendts;
 pub mod socket;
 pub mod tlvforwarder;
 pub mod tracing;

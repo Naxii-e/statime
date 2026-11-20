@@ -1,6 +1,9 @@
 use std::{
-    collections::HashMap, future::Future, path::PathBuf, pin::{pin, Pin}, sync::{Arc, Mutex, RwLock}
+    future::Future, path::PathBuf, pin::{pin, Pin}, sync::{Arc, Mutex, RwLock}
 };
+
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 
 use clap::Parser;
 use rand::{rngs::StdRng, SeedableRng};
@@ -17,17 +20,25 @@ use statime::{
 };
 use statime_linux::{
     clock::{self, LinuxClock, PortTimestampToTime},
-    config::{HardwareClock, PortConfig, ProtocolVersion, SystemClockType},
+    config::{HardwareClock, SystemClockType},
     initialize_logging_parse_config,
     observer::ObservableInstanceState,
+    sendts::resolve_send_timestamp,
     socket::{
-        open_ethernet_socket, open_ipv4_event_socket, open_ipv4_general_socket,
-        open_ipv6_event_socket, open_ipv6_general_socket, PtpTargetAddress,
+        open_ipv4_event_socket, open_ipv4_general_socket, open_ipv6_event_socket,
+        open_ipv6_general_socket, PtpTargetAddress,
     }, tlvforwarder::TlvForwarder
 };
+#[cfg(target_os = "linux")]
+use statime_linux::{
+    config::{PortConfig, ProtocolVersion},
+    socket::open_ethernet_socket,
+};
+#[cfg(target_os = "linux")]
+use timestamped_socket::networkaddress::EthernetAddress;
 use timestamped_socket::{
     interface::{interfaces, InterfaceName},
-    networkaddress::{EthernetAddress, NetworkAddress},
+    networkaddress::NetworkAddress,
     socket::{InterfaceTimestampMode, Open, Socket},
 };
 use tokio::{
@@ -120,6 +131,7 @@ impl Future for Timer {
 
 #[derive(Debug, Clone)]
 enum SystemClock {
+    #[cfg(target_os = "linux")]
     Linux(LinuxClock),
     Overlay(SharedOverlayClock),
     DualLayer(DualLayerOverlayClock),
@@ -127,6 +139,7 @@ enum SystemClock {
 impl SystemClock {
     fn clone_boxed(&self) -> BoxedClock {
         match self {
+            #[cfg(target_os = "linux")]
             Self::Linux(clock) => Box::new(clock.clone()),
             Self::Overlay(clock) => Box::new(clock.clone()),
             Self::DualLayer(clock) => Box::new(clock.clone()),
@@ -141,6 +154,7 @@ enum ClockSyncMode {
     ToSystem,
 }
 
+#[cfg(target_os = "linux")]
 fn start_clock_task(
     clock: LinuxClock,
     system_clock: SystemClock,
@@ -180,6 +194,7 @@ fn start_clock_task(
     mode_sender
 }
 
+#[cfg(target_os = "linux")]
 async fn clock_task<C: Clock<Error = impl core::fmt::Debug>>(
     mut clock: LinuxClock,
     mut system_clock: C,
@@ -484,8 +499,10 @@ async fn actual_main() {
     let mut main_task_senders = Vec::with_capacity(config.ports.len());
     let mut main_task_receivers = Vec::with_capacity(config.ports.len());
 
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut internal_sync_senders = vec![];
 
+    #[cfg(target_os = "linux")]
     let mut clock_name_map = HashMap::new();
     let mut clock_port_map = Vec::with_capacity(config.ports.len());
 
@@ -493,6 +510,7 @@ async fn actual_main() {
 
     let tlv_forwarder = TlvForwarder::new();
 
+    #[cfg(target_os = "linux")]
     let mut add_hw_clock = |idx: u32, clock_port_map: &mut Vec<Option<usize>>, port_config: &PortConfig| {
         let mut clock = LinuxClock::open_idx(idx).expect("Unable to open clock");
         if let Some(id) = clock_name_map.get(&idx) {
@@ -519,7 +537,13 @@ async fn actual_main() {
         (
             None,
             system_clock.clone_boxed(),
-            InterfaceTimestampMode::SoftwareAll,
+            // macOS sockets only provide receive timestamps; send timestamps
+            // fall back to a clock read after send (see handle_actions).
+            if cfg!(target_os = "macos") {
+                InterfaceTimestampMode::SoftwareRecv
+            } else {
+                InterfaceTimestampMode::SoftwareAll
+            },
         )
     };
 
@@ -528,17 +552,26 @@ async fn actual_main() {
         let network_mode = port_config.network_mode;
         let (bind_phc, port_clock, timestamping) = match port_config.hardware_clock {
             HardwareClock::Auto => match interface.lookup_phc() {
+                #[cfg(target_os = "linux")]
                 Some(idx) => add_hw_clock(idx, &mut clock_port_map, &port_config),
+                #[cfg(not(target_os = "linux"))]
+                Some(_) => unreachable!("lookup_phc never finds a PHC on this platform"),
                 None => {
                     log::info!("No hardware clock found, falling back to software timestamping");
                     add_sw_clock(&mut clock_port_map)
                 }
             },
+            #[cfg(target_os = "linux")]
             HardwareClock::Required => {
                 let idx = interface.lookup_phc().expect("No hardware clock found");
                 add_hw_clock(idx, &mut clock_port_map, &port_config)
             }
+            #[cfg(target_os = "linux")]
             HardwareClock::Specific(idx) => add_hw_clock(idx, &mut clock_port_map, &port_config),
+            #[cfg(not(target_os = "linux"))]
+            HardwareClock::Required | HardwareClock::Specific(_) => {
+                unreachable!("rejected by validate_platform")
+            }
             HardwareClock::None => add_sw_clock(&mut clock_port_map),
         };
 
@@ -593,6 +626,11 @@ async fn actual_main() {
                     port_clock,
                 ));
             }
+            #[cfg(not(target_os = "linux"))]
+            statime_linux::config::NetworkMode::Ethernet => {
+                unreachable!("rejected by validate_platform")
+            }
+            #[cfg(target_os = "linux")]
             statime_linux::config::NetworkMode::Ethernet => {
                 let socket = open_ethernet_socket(interface, timestamping, bind_phc)
                     .expect("Could not open socket");
@@ -850,6 +888,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
 // It will then move the port into the running state, and process actions. When
 // the task is notified of a BMCA, it will stop running, move the port into the
 // bmca state, and send it on its Sender
+#[cfg(target_os = "linux")]
 async fn ethernet_port_task(
     mut port_task_receiver: Receiver<BmcaPort>,
     port_task_sender: Sender<BmcaPort>,
@@ -998,14 +1037,18 @@ async fn handle_actions<A: NetworkAddress + PtpTargetAddress>(
                     )
                     .await
                     .expect("Failed to send event message");
+                let after = clock.now();
 
                 // anything we send later will have a later pending (send) timestamp
                 if let Some(time) = time {
                     log::trace!("Send timestamp {:?}", time);
-                    pending_timestamp = Some((context, clock.port_timestamp_to_time(time)));
                 } else {
-                    log::error!("Missing send timestamp");
+                    log::trace!("No socket send timestamp, using clock read after send");
                 }
+                pending_timestamp = Some((
+                    context,
+                    resolve_send_timestamp(time.map(|t| clock.port_timestamp_to_time(t)), after),
+                ));
             }
             PortAction::SendGeneral { data, link_local } => {
                 general_socket
@@ -1044,6 +1087,7 @@ async fn handle_actions<A: NetworkAddress + PtpTargetAddress>(
     pending_timestamp
 }
 
+#[cfg(target_os = "linux")]
 async fn handle_actions_ethernet(
     actions: PortActionIterator<'_>,
     interface: libc::c_int,

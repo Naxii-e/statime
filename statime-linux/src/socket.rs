@@ -1,16 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! Event and General sockets for linux systems
+//! Event and General sockets for unix systems
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
+#[cfg(target_os = "linux")]
+use timestamped_socket::{
+    networkaddress::{EthernetAddress, MacAddress},
+    socket::open_interface_ethernet,
+};
 use timestamped_socket::{
     interface::InterfaceName,
-    networkaddress::{EthernetAddress, MacAddress},
-    socket::{
-        open_interface_ethernet, open_interface_udp4, open_interface_udp6, InterfaceTimestampMode,
-        Open, Socket,
-    },
+    socket::{open_interface_udp4, open_interface_udp6, InterfaceTimestampMode, Open, Socket},
 };
 
 const IPV6_PRIMARY_MULTICAST: Ipv6Addr = Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x181);
@@ -22,6 +23,7 @@ const IPV4_PDELAY_MULTICAST: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 107);
 const EVENT_PORT: u16 = 319;
 const GENERAL_PORT: u16 = 320;
 
+#[cfg(target_os = "linux")]
 const PTP_ETHERTYPE: u16 = 0x88f7;
 
 pub trait PtpTargetAddress {
@@ -45,6 +47,7 @@ impl PtpTargetAddress for SocketAddrV6 {
     const PDELAY_GENERAL: Self = SocketAddrV6::new(IPV6_PDELAY_MULTICAST, GENERAL_PORT, 0, 0);
 }
 
+#[cfg(target_os = "linux")]
 impl PtpTargetAddress for EthernetAddress {
     const PRIMARY_EVENT: Self = EthernetAddress::new(
         PTP_ETHERTYPE,
@@ -107,6 +110,7 @@ pub fn open_ipv6_general_socket(
     Ok(socket)
 }
 
+#[cfg(target_os = "linux")]
 pub fn open_ethernet_socket(
     interface: InterfaceName,
     timestamping: InterfaceTimestampMode,

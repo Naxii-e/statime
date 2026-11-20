@@ -485,6 +485,23 @@ interface = "enp0s31f6"
         assert_eq!(cfg.virtual_system_clock_base, SystemClockType::UptimeRaw);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rejects_uptime_raw() {
+        let cfg: Config = toml::from_str(r#"
+            virtual-system-clock = true
+            virtual-system-clock-base = "uptime_raw"
+            [[port]]
+            interface = "en0"
+        "#).unwrap();
+        assert!(matches!(cfg.validate_platform(), Err(ConfigError::Platform(_))));
+        let cfg: Config = toml::from_str(r#"
+            [[port]]
+            interface = "en0"
+        "#).unwrap();
+        assert!(cfg.validate_platform().is_ok());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_requires_virtual_system_clock() {
