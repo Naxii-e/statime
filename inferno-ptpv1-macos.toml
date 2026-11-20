@@ -1,0 +1,26 @@
+# macOS: PTPv1 follower for Dante devices, exporting the clock to Inferno via usrvclock.
+# Run with: sudo target/debug/statime -c inferno-ptpv1-macos.toml
+# Stop Dante Virtual Soundcard on this Mac first (it uses the same PTP ports).
+loglevel = "debug" # Other values include trace, debug, warn and error
+
+# which ptp network to participate in?
+sdo-id = 0
+domain = 0
+priority1 = 251 # Dante hardware devices use 249 in PTPv2
+
+# macOS: the kernel clock is never modified. These two values are required
+# (any other setting is rejected at startup).
+virtual-system-clock = true
+virtual-system-clock-base = "uptime_raw"
+usrvclock-export = true
+
+[[port]]
+# Replace with the interface connected to the Dante network
+# (see `networksetup -listallhardwareports`).
+interface = "en0"
+network-mode = "ipv4" # ethernet mode is not supported on macOS
+
+# macOS has no PTP hardware clocks
+hardware-clock = "none"
+
+protocol-version = "PTPv1"
