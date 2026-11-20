@@ -57,7 +57,7 @@ with Xcode selected via `xcode-select`.
 
 Setup:
 
-* MacBook running macOS 27.0, wired to the Dante network on `en8`.
+* Mac running macOS 27.0, wired to the Dante network on `en8`.
 * PTPv1 leader: a Dante hardware device (sync interval 250 ms).
 * Transmitter: a Linux Inferno host sending 2ch over unicast.
 * Recording: `inferno2pipe -c 2` for 3600 s (48 kHz, 32-bit).
