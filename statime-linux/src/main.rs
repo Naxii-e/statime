@@ -1043,6 +1043,11 @@ async fn handle_actions<A: NetworkAddress + PtpTargetAddress>(
                 if let Some(time) = time {
                     log::trace!("Send timestamp {:?}", time);
                 } else {
+                    // Linux sockets should always report a send timestamp, so a
+                    // missing one is abnormal; on macOS it is the normal case.
+                    #[cfg(target_os = "linux")]
+                    log::warn!("Missing send timestamp, using clock read after send");
+                    #[cfg(target_os = "macos")]
                     log::trace!("No socket send timestamp, using clock read after send");
                 }
                 pending_timestamp = Some((
